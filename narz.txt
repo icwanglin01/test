@@ -1,0 +1,1283 @@
+-- Unpacked by ZeroVector: the script inside the packed file, as it was written
+--[[
+    SkyP  v1.1.0  (untuk Growblox versi ByteNet)
+    Script tester Growtopia (Roblox) dengan UI WindUI.
+
+    Fitur:
+      - Auto Farm   : place block di tile pilihan (Grid 5x5), lalu break (multi target / Rayman)
+      - Clear World : bersihkan world dari baris atas ke bawah, jalan pakai A*
+      - Farmer      : panen pohon yang sudah siap + tanam seed otomatis
+      - Auto Chat   : kirim beberapa pesan bergantian
+      - Misc        : walkspeed, infinite jump, fly
+      - Staff       : buka backpack staff & pilih title (dikunci server)
+      - Penjaga     : deteksi Mod / Dev / pemain masuk world -> diam / keluar world,
+                      lalu masuk lagi & lanjut aktivitas setelah aman
+      - Bonus       : auto claim quest & auto redeem code
+      - Growscan    : daftar Floating Items & World Blocks
+      - Config      : pengaturan tersimpan otomatis & dimuat saat execute
+      - Watermark   : nama SkyP beranimasi (selalu aktif, hanya di layar sendiri)
+
+    Catatan:
+      - Semua aksi pakai fungsi asli game (place, pukul, ambil drop), bukan klik layar.
+      - Auto collect cek tiap frame & ambil semua drop sekaligus (paralel).
+      - Server menolak fly / noclip / infinite jump, jadi Clear & Farmer selalu jalan menapak.
+        Kalau tidak ada pijakan, script menaruh block dari inventori.
+]]
+
+---------------------------------------------------------------------
+-- SESI: jalankan ulang script = sesi lama dibersihkan dulu
+---------------------------------------------------------------------
+local G = (getgenv and getgenv()) or _G
+for _, key in ipairs({ "__Alfian", "__GTFarm" }) do -- __GTFarm = nama versi lama
+    if G[key] and G[key].Cleanup then pcall(G[key].Cleanup) end
+    G[key] = nil
+end
+local Session = {}
+G.__Alfian = Session
+local function alive()
+    return G.__Alfian == Session
+end
+
+---------------------------------------------------------------------
+-- SERVICES & MODULE GAME
+---------------------------------------------------------------------
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local VirtualUser = game:GetService("VirtualUser")
+local UserInputService = game:GetService("UserInputService")
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+local Shared = ReplicatedStorage:WaitForChild("Shared")
+local WorldRemotes = ReplicatedStorage:WaitForChild("WorldRemotes")
+-- Remote lama (versi game sebelum ByteNet). Hanya dipakai kalau fungsi baru tidak ada.
+local SetTileRemote = WorldRemotes:FindFirstChild("SetTile")
+
+local ItemDB = require(Shared.ItemDB)
+local InventoryModule = require(Shared.Inventory)
+local NetOk, Net = pcall(require, Shared.Net)
+
+local GameGui = PlayerGui:WaitForChild("GameGui")
+local ParticlesOk, ParticlesModule = pcall(require, GameGui:WaitForChild("Particles"))
+local MenuModOk, MenuModule = pcall(require, GameGui:WaitForChild("WorldMenu"))
+local RolesOk, RolesModule = pcall(require, Shared:FindFirstChild("Roles"))
+local SfxOk, SfxModule = pcall(require, Shared:FindFirstChild("Sfx"))
+
+local WindUI = loadstring(game:HttpGet(
+    "https://raw.githubusercontent.com/Mizoree-ux/Tes-aja/refs/heads/main/main.lua"
+))()
+---------------------------------------------------------------------
+-- PENGATURAN & DATA
+---------------------------------------------------------------------
+local State = {
+    Running = false,
+    Mode = "Place + Break",       -- "Place + Break" | "Break saja" | "Place saja"
+    PlaceMs = 250,                -- jeda setelah tiap place
+    BreakMs = 220,                -- jeda tiap pukulan (normal 220)
+    AfterBreakMs = 300,           -- jeda setelah block hancur
+    HitsOverride = 0,             -- jumlah pukulan manual (0 = otomatis)
+    BreakBackground = true,       -- selalu ikut pecah background (tanpa tombol)
+    MultiTarget = 1,              -- jumlah tile dipukul bergantian (1 = biasa)
+    SelectedId = nil,
+    Offsets = {},                 -- tile yang dipilih di Grid
+    CalibX = 0,
+    CalibY = 0,
+    AntiAfk = true,
+    MutePunch = true,
+    LiteMode = false,
+    Role = "none",
+    AutoCollect = true,           -- ambil drop di tile yang dipilih
+    Cycles = 0,
+    Placed = 0,
+    Broken = 0,
+    Collected = 0,                -- jumlah drop yang diambil
+    CollectFail = 0,              -- jumlah drop yang ditolak server
+    LastAction = "-",
+}
+
+local Misc = {
+    Speed = 100,      -- walkspeed % (100 = normal)
+    InfJump = false,
+    Ghost = false,    -- fly + tembus block
+    UpHeld = false,   -- tombol ▲ di layar ditahan
+    DownHeld = false, -- tombol ▼ di layar ditahan
+    CustomName = true,          -- watermark nama (selalu aktif, mati hanya saat script ditutup)
+    NameText = "SkyP",  -- teks watermark
+}
+
+-- Auto Clear World
+local Clear = {
+    Running = false,
+    IncludeBg = true,         -- ikut pecah background
+    UseBlock = true,          -- taruh block kalau tidak ada pijakan
+    ScaffoldId = nil,         -- block yang dipakai untuk pijakan
+    Collect = true,           -- ambil drop tiap habis pecah
+    Sweep = "Kiri → Kanan",   -- "Kiri → Kanan" atau "Zig-zag"
+    Skip = {},                -- tile yang dilewati sementara
+    TopRow = -1,              -- baris yang sedang dibersihkan
+    DirRow = nil,             -- arah zig-zag untuk baris ini
+    Dir = nil,
+    Broken = 0,
+    Remaining = -1,
+    Status = "-",
+}
+
+-- Farmer: panen & tanam otomatis
+local Farmer = {
+    Running = false,
+    Harvest = true,
+    Plant = true,
+    Collect = true,
+    UseBlock = false,   -- taruh block kalau tidak ada jalan
+    ScaffoldId = nil,
+    HarvestMs = 250,    -- jeda setelah tiap panen
+    PlantMs = 250,      -- jeda setelah tiap tanam
+    SeedId = nil,
+    Skip = {},
+    Harvested = 0,
+    Planted = 0,
+    Status = "-",
+}
+
+-- Tombol gerak buatan (dipakai Clear & Farmer)
+local AutoInput = { active = false, left = false, right = false, jump = false, down = false }
+
+-- Auto Chat
+local Spam = {
+    On = false,
+    Texts = {},         -- daftar pesan, dikirim bergantian
+    IntervalSec = 6,
+    Index = 1,
+    Sent = 0,
+    Last = "-",
+}
+
+local Refs = {
+    World = nil,      -- data world (fg, bg, ukuran)
+    Inv = nil,        -- inventori
+    SetTile = nil,    -- fungsi place game
+    State = nil,      -- posisi karakter
+    Punch = nil,      -- fungsi pukul game
+    Particles = {},   -- particle (untuk mode Lite)
+    Menu = nil,       -- menu game (untuk Staff)
+    Gems = nil,       -- update angka gems
+    Hud = nil,        -- jangkauan pukul & place
+    Trees = nil,      -- data pohon (waktu tanam)
+    Others = nil,     -- daftar pemain lain di world (untuk Penjaga)
+}
+
+-- Daftar drop di world (diambil dari game)
+local Drops = { list = nil, update = nil }
+local DropFailUntil = {}   -- drop yang ditolak, dicoba lagi nanti
+
+local UI = {}
+local Connections = {}
+local HitCount = {}   -- hitung pukulan (cadangan)
+local PlacedAt = {}   -- kapan tile di-place
+
+local function notify(title, content, dur)
+    task.defer(function()
+        pcall(function()
+            WindUI:Notify({ Title = title, Content = content, Duration = dur or 3, Icon = "info" })
+        end)
+    end)
+end
+
+---------------------------------------------------------------------
+-- CONFIG: simpan & muat pengaturan otomatis
+---------------------------------------------------------------------
+-- Cara kerja:
+--   1. Saat execute, file config dibaca lalu nilainya dipasang ke pengaturan
+--      SEBELUM UI dibuat, jadi tombol & slider langsung tampil sesuai config.
+--   2. Tiap 3 detik pengaturan sekarang dibandingkan dengan yang terakhir disimpan.
+--      Ada yang berubah -> langsung disimpan (auto save).
+--   3. File per akun: workspace/Alfian/config_<UserId>.json
+--   Yang tidak disimpan: tombol jalan (Auto Farm / Clear / Farmer / Chat), fly & inf jump.
+local Config = {
+    AutoSave = true,
+    Paused = false,      -- true setelah reset (supaya file tidak dibuat lagi)
+    Folder = "Alfian",
+    Data = {},           -- isi file saat execute
+    List = {},           -- tabel pengaturan yang disimpan
+    LastJson = nil,
+    Status = "-",
+}
+
+do (function() -- fungsi sendiri: variabel di dalam tidak ikut batas 200 local
+    local HttpService = game:GetService("HttpService")
+    local canFile = type(writefile) == "function" and type(readfile) == "function" and type(isfile) == "function"
+    Config.CanFile = canFile
+    Config.Path = Config.Folder .. "/config_" .. tostring(LocalPlayer.UserId) .. ".json"
+
+    local function read()
+        if not canFile then return nil end
+        local okE, exists = pcall(isfile, Config.Path)
+        if not okE or not exists then return nil end
+        local okR, raw = pcall(readfile, Config.Path)
+        if not okR or type(raw) ~= "string" then return nil end
+        local okD, data = pcall(HttpService.JSONDecode, HttpService, raw)
+        if okD and type(data) == "table" then return data end
+        return nil
+    end
+
+    local loaded = read()
+    Config.Found = loaded ~= nil
+    Config.Data = loaded or {}
+    if Config.Data.AutoSave == false then Config.AutoSave = false end
+    Config.Status = Config.Found and "Config dimuat" or (canFile and "Belum ada config" or "Executor tidak bisa simpan file")
+
+    -- Daftarkan tabel pengaturan. Nilai dari file langsung dipasang
+    -- (kecuali key di 'later', dipasang sendiri setelah terhubung ke game).
+    function Config.add(name, tbl, keys, later)
+        table.insert(Config.List, { name = name, tbl = tbl, keys = keys })
+        local saved = Config.Data[name]
+        if type(saved) ~= "table" then return end
+        for _, k in ipairs(keys) do
+            local v, cur = saved[k], tbl[k]
+            if v ~= nil and not (later and later[k]) and (cur == nil or type(v) == type(cur)) then
+                tbl[k] = v
+            end
+        end
+    end
+
+    function Config.saved(name, key)
+        local t = Config.Data[name]
+        return type(t) == "table" and t[key] or nil
+    end
+
+    local function collect()
+        local out = { AutoSave = Config.AutoSave, Version = 1 }
+        for _, e in ipairs(Config.List) do
+            local t = {}
+            for _, k in ipairs(e.keys) do t[k] = e.tbl[k] end
+            out[e.name] = t
+        end
+        return out
+    end
+
+    function Config.save(force)
+        if not canFile then
+            Config.Status = "Executor tidak bisa simpan file"
+            return false
+        end
+        if Config.Paused and not force then return false end
+        local okJ, json = pcall(HttpService.JSONEncode, HttpService, collect())
+        if not okJ then
+            Config.Status = "Gagal membaca pengaturan"
+            return false
+        end
+        if not force and json == Config.LastJson then return true end
+        if type(isfolder) == "function" and type(makefolder) == "function" then
+            local okF, has = pcall(isfolder, Config.Folder)
+            if okF and not has then pcall(makefolder, Config.Folder) end
+        end
+        local ok = pcall(writefile, Config.Path, json)
+        if ok then
+            Config.LastJson = json
+            Config.Paused = false
+            Config.Status = "Tersimpan " .. os.date("%H:%M:%S")
+        else
+            Config.Status = "Gagal simpan file"
+        end
+        return ok
+    end
+
+    -- Hapus file config (execute ulang = kembali ke default)
+    function Config.reset()
+        Config.Paused = true
+        Config.LastJson = nil
+        if canFile and type(delfile) == "function" then
+            local ok = pcall(delfile, Config.Path)
+            Config.Status = ok and "Config dihapus. Execute ulang untuk default" or "Gagal hapus file"
+            return ok
+        end
+        Config.Status = "Executor tidak bisa hapus file"
+        return false
+    end
+
+    function Config.start()
+        -- tandai kondisi sekarang sebagai "sudah tersimpan" kalau sama dengan file
+        if Config.Found then
+            local okJ, json = pcall(HttpService.JSONEncode, HttpService, collect())
+            if okJ then Config.LastJson = json end
+        end
+        task.spawn(function()
+            while alive() do
+                task.wait(3)
+                if Config.AutoSave and alive() then Config.save(false) end
+            end
+        end)
+    end
+end)() end
+
+Config.add("Farm", State, {
+    "Mode", "PlaceMs", "BreakMs", "AfterBreakMs", "HitsOverride", "SelectedId", "Offsets",
+    "CalibX", "CalibY", "AntiAfk", "MutePunch", "LiteMode", "AutoCollect", "MultiTarget",
+})
+Config.add("Clear", Clear, { "UseBlock", "ScaffoldId", "Collect", "Sweep" })
+Config.add("Farmer", Farmer, { "Harvest", "Plant", "Collect", "UseBlock", "ScaffoldId", "HarvestMs", "PlantMs", "SeedId" })
+Config.add("Misc", Misc, { "Speed" })
+Config.add("Chat", Spam, { "Texts", "IntervalSec" })
+
+---------------------------------------------------------------------
+-- CARI DATA & FUNGSI GAME (getgc)
+---------------------------------------------------------------------
+local getconsts = (debug and debug.getconstants) or getconstants
+
+-- Fungsi place game: satu-satunya yang memakai "placedAt" + "flips" sekaligus.
+-- Kirimnya "tile" (game baru, ByteNet) atau "SetTile" (game lama).
+local function isSetTileFn(fn)
+    if not getconsts then return false end
+    if islclosure and not islclosure(fn) then return false end
+    local ok, consts = pcall(getconsts, fn)
+    if not ok or type(consts) ~= "table" then return false end
+    local hasSend, hasPlaced, hasFlips = false, false, false
+    for _, c in pairs(consts) do
+        if c == "tile" or c == "SetTile" then hasSend = true
+        elseif c == "placedAt" then hasPlaced = true
+        elseif c == "flips" then hasFlips = true end
+    end
+    return hasSend and hasPlaced and hasFlips
+end
+
+-- Fungsi pukul game: teks "Empty the Vending Machine first!" + "newCrack"
+-- (game lama: "HarvestProvider")
+local function isPunchFn(fn)
+    if not getconsts then return false end
+    if islclosure and not islclosure(fn) then return false end
+    local ok, consts = pcall(getconsts, fn)
+    if not ok or type(consts) ~= "table" then return false end
+    local hasVend, hasMark = false, false
+    for _, c in pairs(consts) do
+        if c == "Empty the Vending Machine first!" then hasVend = true
+        elseif c == "newCrack" or c == "HarvestProvider" then hasMark = true end
+    end
+    return hasVend and hasMark
+end
+
+local function isStateHolder(v)
+    local fn = rawget(v, "state")
+    if type(fn) ~= "function" then return false end
+    local ok, s = pcall(fn)
+    return ok and type(s) == "table" and type(s.x) == "number" and type(s.y) == "number"
+        and s.facing ~= nil and s.vx ~= nil
+end
+
+-- Pastikan fungsi milik game, bukan milik script ini
+local function isGameFn(fn)
+    if fn == isSetTileFn or fn == isPunchFn then return false end
+    if isexecutorclosure then
+        local ok, res = pcall(isexecutorclosure, fn)
+        if ok and res then return false end
+    end
+    local ok, src = pcall(debug.info, fn, "s")
+    if ok and type(src) == "string" and src ~= "" and not string.find(src, "GameGui", 1, true) then
+        return false
+    end
+    return true
+end
+
+local function findRefs()
+    Refs.World, Refs.Inv, Refs.SetTile, Refs.State, Refs.Punch, Refs.Menu = nil, nil, nil, nil, nil, nil
+    Refs.Gems = nil
+    Refs.Hud = nil
+    Refs.Others = nil
+    Refs.Particles = {}
+    if not getgc then
+        return false, "Executor tidak punya getgc()"
+    end
+    for _, v in ipairs(getgc(true)) do
+        local tv = type(v)
+        if tv == "table" then
+            if not Refs.World then
+                local ok, isWorld = pcall(function()
+                    return type(rawget(v, "fg")) == "table" and type(rawget(v, "bg")) == "table"
+                        and type(rawget(v, "w")) == "number" and type(rawget(v, "h")) == "number"
+                        and rawget(v, "spawn") ~= nil
+                end)
+                if ok and isWorld then Refs.World = v end
+            end
+            if not Refs.Inv then
+                local ok, isInv = pcall(function()
+                    return getmetatable(v) == InventoryModule and type(rawget(v, "slots")) == "table"
+                        and rawget(v, "capacity") ~= nil
+                end)
+                if ok and isInv then Refs.Inv = v end
+            end
+            if not Refs.State then
+                local ok, isHolder = pcall(isStateHolder, v)
+                if ok and isHolder then Refs.State = rawget(v, "state") end
+            end
+            if not Refs.Menu then
+                local ok, isMenu = pcall(function()
+                    return type(rawget(v, "openBackpack")) == "function" and type(rawget(v, "ui")) == "table"
+                end)
+                if ok and isMenu then Refs.Menu = v end
+            end
+            if not Refs.Gems then
+                local ok, isG = pcall(function() return type(rawget(v, "addGems")) == "function" end)
+                if ok and isG then Refs.Gems = v end
+            end
+            if not Refs.Hud then
+                local ok, isH = pcall(function()
+                    return type(rawget(v, "punchRange")) == "function" and type(rawget(v, "handPower")) == "function"
+                end)
+                if ok and isH then Refs.Hud = v end
+            end
+            if not Refs.Others then
+                -- data pemain lain: punya list(), where(), playerAt()
+                local ok, isO = pcall(function()
+                    return type(rawget(v, "list")) == "function" and type(rawget(v, "where")) == "function"
+                        and type(rawget(v, "playerAt")) == "function"
+                end)
+                if ok and isO then Refs.Others = v end
+            end
+            if ParticlesOk then
+                local ok, isP = pcall(function()
+                    return getmetatable(v) == ParticlesModule and type(rawget(v, "live")) == "table"
+                        and type(rawget(v, "free")) == "table"
+                end)
+                if ok and isP then table.insert(Refs.Particles, v) end
+            end
+        elseif tv == "function" and (not Refs.SetTile or not Refs.Punch) and isGameFn(v) then
+            if not Refs.SetTile and isSetTileFn(v) then
+                Refs.SetTile = v
+            elseif not Refs.Punch and isPunchFn(v) then
+                Refs.Punch = v
+            end
+        end
+        if Refs.World and Refs.Inv and Refs.SetTile and Refs.State and Refs.Punch
+            and Refs.Menu and Refs.Gems and Refs.Hud and Refs.Others then break end
+    end
+    return Refs.World ~= nil
+end
+
+local function refsText()
+    return "World: " .. (Refs.World and "OK" or "TIDAK")
+        .. " | Inventori: " .. (Refs.Inv and "OK" or "TIDAK")
+        .. " | setTile: " .. (Refs.SetTile and "OK" or "cadangan")
+        .. " | Posisi: " .. (Refs.State and "OK" or "cadangan")
+        .. " | Pukul: " .. (Refs.Punch and "OK" or "TIDAK")
+        .. " | Drop: " .. (Drops.list and "OK" or "TIDAK")
+        .. " | Pohon: " .. (Refs.Trees and "OK" or "TIDAK")
+        .. " | Pemain: " .. (Refs.Others and "OK" or "TIDAK")
+end
+
+---------------------------------------------------------------------
+-- ITEM & INVENTORI
+---------------------------------------------------------------------
+local function itemName(id)
+    local it = ItemDB[id]
+    return (it and it.name) or ("Item #" .. tostring(id))
+end
+
+local function invCount(id)
+    if not Refs.Inv then return 0 end
+    local ok, n = pcall(function() return Refs.Inv:count(id) end)
+    return ok and n or 0
+end
+
+local function isPlaceable(id)
+    local it = ItemDB[id]
+    if not it then return false end
+    if it.kind == "tool" or it.kind == "cloth" or it.kind == "clothes" or it.kind == "consumable" then
+        return false
+    end
+    if it.lock or it.area then return false end
+    return true
+end
+
+local function placeableIds()
+    local ids = {}
+    if Refs.Inv then
+        for _, slot in ipairs(Refs.Inv.slots) do
+            if slot.id and (slot.n or 0) > 0 and isPlaceable(slot.id) then
+                ids[#ids + 1] = slot.id
+            end
+        end
+    end
+    table.sort(ids)
+    return ids
+end
+
+local function inventoryLabels(ids)
+    local out = {}
+    for _, id in ipairs(ids or placeableIds()) do
+        out[#out + 1] = string.format("%s [%d]", itemName(id), id)
+    end
+    if #out == 0 then out = { "(inventori kosong / belum terbaca)" } end
+    return out
+end
+
+-- Dropdown cuma di-refresh kalau jenis item berubah (biar tidak lag)
+local lastInvSig = nil
+local invRefreshPending = false
+
+local lastSeedSig = nil
+local lastBlockSig = nil
+
+-- Seed di inventori (untuk Farmer)
+local function seedIds()
+    local ids = {}
+    if Refs.Inv then
+        for _, slot in ipairs(Refs.Inv.slots) do
+            local it = slot.id and ItemDB[slot.id]
+            if it and it.kind == "seed" and (slot.n or 0) > 0 then
+                ids[#ids + 1] = slot.id
+            end
+        end
+    end
+    table.sort(ids)
+    return ids
+end
+
+-- Setelah daftar di-refresh, pilih lagi item yang sedang dipakai (dari config / pilihan lama)
+local function selectSaved(dd, labels, id)
+    if not dd or not id then return end
+    local want = "[" .. tostring(id) .. "]"
+    for _, label in ipairs(labels) do
+        if string.sub(label, -#want) == want then
+            pcall(function() dd:Select(label) end)
+            return
+        end
+    end
+end
+
+local function doInvRefresh(force)
+    local ids = placeableIds()
+    local sig = table.concat(ids, ",")
+    if force or sig ~= lastInvSig then
+        lastInvSig = sig
+        local labels = inventoryLabels(ids)
+        pcall(function() UI.InvDropdown:Refresh(labels) end)
+        selectSaved(UI.InvDropdown, labels, State.SelectedId)
+    end
+    local sids = seedIds()
+    local ssig = table.concat(sids, ",")
+    if force or ssig ~= lastSeedSig then
+        lastSeedSig = ssig
+        local labels = {}
+        for _, id in ipairs(sids) do
+            labels[#labels + 1] = string.format("%s [%d]", itemName(id), id)
+        end
+        if #labels == 0 then labels = { "(tidak ada seed di inventori)" } end
+        pcall(function() UI.SeedDropdown:Refresh(labels) end)
+        selectSaved(UI.SeedDropdown, labels, Farmer.SeedId)
+    end
+    -- block padat untuk pijakan
+    local bids = {}
+    for _, id in ipairs(ids) do
+        local it = ItemDB[id]
+        if it and it.solid and it.kind ~= "seed" then bids[#bids + 1] = id end
+    end
+    local bsig = table.concat(bids, ",")
+    if force or bsig ~= lastBlockSig then
+        lastBlockSig = bsig
+        local labels = {}
+        for _, id in ipairs(bids) do
+            labels[#labels + 1] = string.format("%s [%d]", itemName(id), id)
+        end
+        if #labels == 0 then labels = { "(tidak ada block padat di inventori)" } end
+        pcall(function() UI.ClearBlockDropdown:Refresh(labels) end)
+        pcall(function() UI.FarmerBlockDropdown:Refresh(labels) end)
+        selectSaved(UI.ClearBlockDropdown, labels, Clear.ScaffoldId)
+        selectSaved(UI.FarmerBlockDropdown, labels, Farmer.ScaffoldId)
+    end
+end
+
+local function refreshInvDropdown(force)
+    if force then
+        task.defer(function()
+            if alive() then doInvRefresh(true) end
+        end)
+        return
+    end
+    if invRefreshPending then return end
+    invRefreshPending = true
+    task.delay(1, function()
+        invRefreshPending = false
+        if alive() then doInvRefresh(false) end
+    end)
+end
+
+local invConn
+local function watchInventory()
+    if invConn then pcall(function() invConn:Disconnect() end) end
+    if Refs.Inv and typeof(Refs.Inv.changed) == "Instance" then
+        invConn = Refs.Inv.changed.Event:Connect(function()
+            if alive() then refreshInvDropdown(false) end
+        end)
+        table.insert(Connections, invConn)
+    end
+end
+
+---------------------------------------------------------------------
+-- WORLD: tile & posisi karakter
+---------------------------------------------------------------------
+local function tileAt(layer, x, y)
+    local w = Refs.World
+    if not w or x < 0 or y < 0 or x >= w.w or y >= w.h then return nil end
+    local grid = w[layer]
+    local row = grid and grid[y]
+    return row and (row[x] or 0) or nil
+end
+
+local function getView()
+    local gg = PlayerGui:FindFirstChild("GameGui")
+    local cam = gg and gg:FindFirstChild("World") and gg.World:FindFirstChild("Camera")
+    local tiles = cam and cam:FindFirstChild("Tiles")
+    local pv = cam and cam:FindFirstChild("PlayerView")
+    if not (tiles and pv) then return nil end
+    local sample = tiles:FindFirstChildWhichIsA("ImageLabel")
+    if not sample or sample.AbsoluteSize.X <= 0 then return nil end
+    return { tiles = tiles, pv = pv, ts = sample.AbsoluteSize.X }
+end
+
+local function getPlayerTile()
+    if Refs.State then
+        local ok, s = pcall(Refs.State)
+        if ok and type(s) == "table" and type(s.x) == "number" then
+            if s.active == false then return nil end
+            return math.floor(s.x) + State.CalibX, math.floor(s.y - 0.475) + State.CalibY
+        end
+    end
+    local v = getView()
+    if not v then return nil end
+    local center = v.pv.AbsolutePosition + v.pv.AbsoluteSize / 2
+    local rel = center - v.tiles.AbsolutePosition
+    return math.floor(rel.X / v.ts) + State.CalibX, math.floor(rel.Y / v.ts) + State.CalibY
+end
+
+local function sortedOffsets()
+    local list = {}
+    for key in pairs(State.Offsets) do
+        local dx, dy = string.match(key, "^(-?%d+),(-?%d+)$")
+        table.insert(list, { dx = tonumber(dx), dy = tonumber(dy) })
+    end
+    table.sort(list, function(a, b)
+        if a.dy ~= b.dy then return a.dy < b.dy end
+        return a.dx < b.dx
+    end)
+    return list
+end
+
+---------------------------------------------------------------------
+-- AKSI DASAR: place & pukul
+---------------------------------------------------------------------
+local function sendSetTile(layer, x, y, id)
+    if Refs.SetTile then
+        local ok, err = pcall(Refs.SetTile, layer, x, y, id, false, false)
+        if ok then return true end
+        warn("[SkyP] setTile game gagal, pakai remote langsung: " .. tostring(err))
+    end
+    if NetOk and type(Net) == "table" and type(Net.tile) == "table" then
+        -- sama seperti game: layer 1 = fg, 2 = bg
+        local ok = pcall(Net.tile.send, {
+            layer = (layer == "bg") and 2 or 1, x = x, y = y, id = id, flip = false,
+        })
+        if not ok then return false end
+    elseif SetTileRemote then
+        SetTileRemote:FireServer(layer, x, y, id, false)
+    else
+        return false
+    end
+    local grid = Refs.World and Refs.World[layer]
+    if grid and grid[y] then grid[y][x] = id end
+    return true
+end
+
+local function sendHitFx(x, y)
+    if NetOk and type(Net) == "table" and Net.act then
+        pcall(Net.act.send, { x = x + 0.5, y = y + 0.5 })
+    end
+end
+
+local function hitsNeeded(id)
+    if State.HitsOverride > 0 then return State.HitsOverride end
+    local it = ItemDB[id]
+    if not it then return 4 end
+    local h = (it.kind == "seed") and 3 or it.hits
+    return tonumber(h) or 4
+end
+
+local function canBreak(id)
+    if id == 0 then return false end
+    local it = ItemDB[id]
+    if not it then return true end
+    if it.lock or it.area or it.vend or it.display then return false end
+    local h = (it.kind == "seed") and 3 or it.hits
+    return h == nil or h > 0
+end
+
+-- Game abaikan pukulan ke tile yang baru di-place (< 0.3 detik)
+local PLACE_GUARD = 0.32
+
+-- Place 1 tile kalau kosong. Hasil: "place" / "habis" / nil
+local function tryPlace(x, y)
+    if not State.SelectedId then return nil end
+    local fg = tileAt("fg", x, y)
+    if fg == nil then return nil end
+    local bg = tileAt("bg", x, y)
+    local it = ItemDB[State.SelectedId]
+    local layer = (it and it.background) and "bg" or "fg"
+    local cur = (layer == "bg") and bg or fg
+    if not (cur == 0 and (layer == "bg" or fg == 0)) then return nil end
+    if invCount(State.SelectedId) <= 0 then return "habis" end
+
+    sendSetTile(layer, x, y, State.SelectedId)
+    if Refs.Inv then pcall(function() Refs.Inv:remove(State.SelectedId, 1) end) end
+    local key = x .. "," .. y
+    HitCount[key] = nil
+    PlacedAt[key] = os.clock()
+    State.Placed += 1
+    State.LastAction = "Place " .. itemName(State.SelectedId) .. " (" .. x .. "," .. y .. ")"
+    return "place"
+end
+
+-- Masih ada yang bisa dipecah di tile ini? (block depan / background)
+local function breakableAt(x, y)
+    local fg = tileAt("fg", x, y)
+    if fg == nil then return false end
+    if fg ~= 0 then return canBreak(fg) end
+    local bg = tileAt("bg", x, y)
+    return State.BreakBackground and bg ~= nil and bg ~= 0 and canBreak(bg)
+end
+
+-- Pukul 1 kali. Hasil: "hit" / "broke" / nil
+-- includeBg = ikut pecah background
+local function tryBreak(x, y, includeBg)
+    if includeBg == nil then includeBg = State.BreakBackground end
+    local key = x .. "," .. y
+    local fg = tileAt("fg", x, y)
+    if fg == nil then return nil end
+    local bg = tileAt("bg", x, y)
+    local layer, id
+    if fg ~= 0 then
+        layer, id = "fg", fg
+    elseif includeBg and bg ~= 0 then
+        layer, id = "bg", bg
+    end
+    if not layer or not canBreak(id) then return nil end
+
+    -- tunggu sebentar kalau tile baru di-place
+    local t = PlacedAt[key]
+    if t then
+        local age = os.clock() - t
+        if age < PLACE_GUARD then task.wait(PLACE_GUARD - age) end
+        PlacedAt[key] = nil
+    end
+
+    if Refs.Punch then
+        local ok, err = pcall(Refs.Punch, x, y, State.MutePunch or nil, nil)
+        if not ok then
+            State.LastAction = "Error pukul: " .. tostring(err)
+            return nil
+        end
+        if tileAt(layer, x, y) ~= id then
+            State.Broken += 1
+            State.LastAction = "Break " .. itemName(id) .. " (" .. x .. "," .. y .. ")"
+            return "broke"
+        end
+        State.LastAction = "Pukul " .. itemName(id) .. " (" .. x .. "," .. y .. ")"
+        return "hit"
+    end
+
+    -- Cadangan: hitung pukulan sendiri
+    local hc = HitCount[key]
+    if not hc or hc.id ~= id or hc.layer ~= layer then
+        hc = { id = id, layer = layer, n = 0 }
+        HitCount[key] = hc
+    end
+    hc.n += 1
+    sendHitFx(x, y)
+    local need = hitsNeeded(id)
+    if hc.n >= need then
+        sendSetTile(layer, x, y, 0)
+        HitCount[key] = nil
+        State.Broken += 1
+        State.LastAction = "Break " .. itemName(id) .. " (" .. x .. "," .. y .. ")"
+        return "broke"
+    end
+    State.LastAction = "Pukul " .. itemName(id) .. " " .. hc.n .. "/" .. need
+    return "hit"
+end
+
+---------------------------------------------------------------------
+-- AUTO COLLECT
+---------------------------------------------------------------------
+-- Cara game: World.takeDrop(uid, jumlah) -> server balas jumlahnya -> masuk inventori.
+-- Game cuma ambil drop yang disentuh badan; di sini drop diambil langsung.
+local TakeDropRemote = WorldRemotes:FindFirstChild("TakeDrop") -- game lama saja
+
+local function getUpvalues(fn)
+    if debug and debug.getupvalues then
+        local ok, ups = pcall(debug.getupvalues, fn)
+        if ok and type(ups) == "table" then return ups end
+    end
+    local out = {}
+    local gu = (debug and debug.getupvalue) or getupvalue
+    if gu then
+        for i = 1, 60 do
+            local ok, v = pcall(gu, fn, i)
+            if not ok then break end
+            out[i] = v
+        end
+    end
+    return out
+end
+
+-- Cek apakah tabel ini daftar drop game
+local function isDropList(t)
+    if type(t) ~= "table" or t == Refs.World then return false end
+    local first = rawget(t, 1)
+    if first == nil then return next(t) == nil end
+    return type(first) == "table" and rawget(first, "uid") ~= nil and rawget(first, "frame") ~= nil
+end
+
+local function findDropRefs()
+    Drops.list, Drops.update = nil, nil
+    -- 1) dari fungsi World.dropTaken (isinya: daftar drop + fungsi update)
+    local wd = Refs.World and rawget(Refs.World, "dropTaken")
+    if type(wd) == "function" then
+        for _, u in pairs(getUpvalues(wd)) do
+            if not Drops.list and isDropList(u) then
+                Drops.list = u
+            elseif not Drops.update and type(u) == "function" then
+                Drops.update = u
+            end
+        end
+    end
+    -- 2) dari handler DropTaken game
+    local ev = WorldRemotes:FindFirstChild("DropTaken")
+    if not Drops.list and ev and getconnections then
+        local ok, conns = pcall(getconnections, ev.OnClientEvent)
+        if ok and type(conns) == "table" then
+            for _, c in ipairs(conns) do
+                local okf, fn = pcall(function() return c.Function end)
+                if okf and type(fn) == "function" then
+                    for _, u in pairs(getUpvalues(fn)) do
+                        if not Drops.list and isDropList(u) then
+                            Drops.list = u
+                        elseif not Drops.update and type(u) == "function" then
+                            Drops.update = u
+                        end
+                    end
+                end
+                if Drops.list then break end
+            end
+        end
+    end
+    -- 3) cadangan: cari lewat getgc
+    if not Drops.list and getgc then
+        for _, v in ipairs(getgc(true)) do
+            if type(v) == "table" then
+                local e = rawget(v, 1)
+                if type(e) == "table" and rawget(e, "uid") ~= nil and rawget(e, "frame") ~= nil
+                    and rawget(e, "born") ~= nil then
+                    Drops.list = v
+                    break
+                end
+            end
+        end
+    end
+    return Drops.list ~= nil
+end
+
+local function takeDrop(d)
+    local worldTake = Refs.World and rawget(Refs.World, "takeDrop")
+    if type(worldTake) ~= "function" and not TakeDropRemote then return false end
+    if d.taking or d.pending or d.display or (d.n or 0) <= 0 then return false end
+    -- drop yang kamu buang sendiri belum boleh dipungut lagi (aturan game), kecuali gems
+    if d.armed == false and d.id ~= 112 then return false end
+    local now = os.clock()
+    if DropFailUntil[d.uid] and now < DropFailUntil[d.uid] then return false end
+
+    local amount = d.n
+    if d.id ~= 112 and Refs.Inv then -- 112 = gems, tidak makan slot
+        local okr, room = pcall(function() return Refs.Inv:room(d.id) end)
+        if okr and type(room) == "number" then amount = math.min(amount, room) end
+    end
+    if amount <= 0 then -- inventori penuh: coba lagi 1 detik lagi
+        DropFailUntil[d.uid] = now + 1
+        return false
+    end
+
+    d.taking = true -- cegah diambil dobel
+    -- langsung hilang dari layar (sama seperti game saat memungut drop)
+    d.flown = true
+    if typeof(d.frame) == "Instance" then pcall(function() d.frame.Visible = false end) end
+    local ok, taken
+    if type(worldTake) == "function" then
+        ok, taken = pcall(worldTake, d.uid, amount) -- cara game baru
+    else
+        ok, taken = pcall(TakeDropRemote.InvokeServer, TakeDropRemote, d.uid, amount)
+    end
+    d.taking = false
+
+    if not (ok and type(taken) == "number" and taken > 0) then
+        State.CollectFail += 1
+        d.refused = os.clock() -- tanda ditolak, sama seperti game
+        DropFailUntil[d.uid] = os.clock() + 1 -- coba lagi 1 detik lagi (sama seperti game)
+        d.flown = nil
+        if typeof(d.frame) == "Instance" then pcall(function() d.frame.Visible = not d.culled end) end
+        return false
+    end
+    DropFailUntil[d.uid] = nil
+
+    if d.id == 112 then
+        if Refs.Gems then pcall(Refs.Gems.addGems, taken) end
+    elseif Refs.Inv then
+        pcall(function() Refs.Inv:add(d.id, taken) end)
+    end
+    if Drops.list and Drops.update and table.find(Drops.list, d) then
+        pcall(Drops.update, d, d.n - taken) -- kurangi / hapus drop seperti game
+    end
+    State.Collected += taken
+    State.LastAction = "Collect " .. itemName(d.id) .. " x" .. taken
+    return true
+end
+
+local function inTile(t, x, y)
+    return x >= t.x - 0.15 and x < t.x + 1.15 and y >= t.y - 0.15 and y < t.y + 1.15
+end
+
+-- ---------- Collector cepat ----------
+-- Cek daftar drop TIAP FRAME. Drop di area langsung diambil, semuanya sekaligus
+-- (paralel), jadi tidak antri menunggu balasan server satu per satu.
+--   Auto Farm  : drop di tile yang dipilih di Grid
+--   Clear / Farmer : drop di sekitar karakter
+local OffsetParse = {}
+local nextDropScan = 0
+
+local function canTry(d, now)
+    if type(d) ~= "table" or d.taking or (d.n or 0) <= 0 or type(d.x) ~= "number" then return false end
+    if d.armed == false and d.id ~= 112 then return false end
+    local fail = DropFailUntil[d.uid]
+    return not (fail and now < fail)
+end
+
+local function collectTick()
+    local farmArea = State.AutoCollect and next(State.Offsets) ~= nil
+    local nearArea = (Clear.Running and Clear.Collect) or (Farmer.Running and Farmer.Collect)
+    if not farmArea and not nearArea then return end
+
+    local list = Drops.list
+    if not list then
+        local now = os.clock()
+        if now >= nextDropScan then -- cari daftar drop paling sering tiap 5 detik
+            nextDropScan = now + 5
+            findDropRefs()
+        end
+        return
+    end
+    if #list == 0 then return end
+
+    local ok, s = false, nil
+    if Refs.State then ok, s = pcall(Refs.State) end
+    if not (ok and type(s) == "table" and type(s.x) == "number") then return end
+    local cx, cy = s.x, s.y - 0.475
+    local ptx, pty = getPlayerTile()
+    local now = os.clock()
+
+    for i = #list, 1, -1 do
+        local d = list[i]
+        if canTry(d, now) then
+            local hit = nearArea and math.abs(d.x - cx) <= 3.2 and math.abs(d.y - cy) <= 3.2
+            if not hit and farmArea and ptx then
+                for key in pairs(State.Offsets) do
+                    local o = OffsetParse[key]
+                    if not o then
+                        local dx, dy = string.match(key, "^(-?%d+),(-?%d+)$")
+                        o = { tonumber(dx), tonumber(dy) }
+                        OffsetParse[key] = o
+                    end
+                    if inTile({ x = ptx + o[1], y = pty + o[2] }, d.x, d.y) then
+                        hit = true
+                        break
+                    end
+                end
+            end
+            if hit then task.spawn(takeDrop, d) end
+        end
+    end
+end
+
+table.insert(Connections, RunService.Heartbeat:Connect(function()
+    if alive() then collectTick() end
+end))
+
+-- Tunggu sebentar sampai drop di tile ini terambil (supaya tidak tertimpa block baru)
+local function waitTileDrops(t, maxSec)
+    local list = Drops.list
+    if not list then return end
+    local t0 = os.clock()
+    while os.clock() - t0 < maxSec and alive() do
+        local now, busy = os.clock(), false
+        for _, d in ipairs(list) do
+            if type(d) == "table" and type(d.x) == "number" and (d.n or 0) > 0 and inTile(t, d.x, d.y)
+                and (d.taking or canTry(d, now)) then
+                busy = true
+                break
+            end
+        end
+        if not busy then return end
+        task.wait()
+    end
+end
+
+---------------------------------------------------------------------
+-- STATUS
+---------------------------------------------------------------------
+local function offsetsText()
+    local list = {}
+    for _, o in ipairs(sortedOffsets()) do
+        table.insert(list, "(" .. o.dx .. "," .. o.dy .. ")")
+    end
+    return #list > 0 and table.concat(list, " ") or "-"
+end
+
+local lastStatusText = nil
+
+local function updateStatus()
+    if not UI.Status then return end
+    local px, py = getPlayerTile()
+    local sel = State.SelectedId
+    local txt = "Status   : " .. (State.Running and "JALAN" or "BERHENTI")
+        .. "\nBlock    : " .. (sel and (itemName(sel) .. " x" .. invCount(sel)) or "-")
+        .. "\nKarakter : " .. (px and ("(" .. px .. "," .. py .. ")") or "tidak di world")
+        .. "\nTile     : " .. offsetsText()
+        .. "\nPlace/Break/Collect : " .. State.Placed .. " / " .. State.Broken .. " / " .. State.Collected
+        .. (State.CollectFail > 0 and (" (ditolak " .. State.CollectFail .. ")") or "")
+        .. "\nAksi     : " .. State.LastAction
+    if txt == lastStatusText then return end
+    lastStatusText = txt
+    task.defer(function()
+        pcall(function() UI.Status:SetDesc(txt) end)
+    end)
+end
+
+---------------------------------------------------------------------
+-- MODE LITE (matikan particle + suara)
+---------------------------------------------------------------------
+local DummyLabel = setmetatable({}, { __index = function() return 0 end, __newindex = function() end })
+local DummyParticle = setmetatable({ l = DummyLabel, k = {} }, { __index = function() return 0 end, __newindex = function() end })
+local NullSound
+NullSound = setmetatable({}, {
+    __index = function() return NullSound end,
+    __newindex = function() end,
+    __call = function() return NullSound end,
+})
+local LiteSaved = {}
+
+local function liteOverride(tbl, key, repl)
+    if type(tbl) == "table" and type(rawget(tbl, key)) == "function" then
+        table.insert(LiteSaved, { tbl, key, rawget(tbl, key) })
+        tbl[key] = repl
+    end
+end
+
+local function setLite(on)
+    State.LiteMode = on
+    if on then
+        if #LiteSaved == 0 then
+            if ParticlesOk then liteOverride(ParticlesModule, "spawn", function() return DummyParticle end) end
+            if SfxOk then
+                liteOverride(SfxModule, "play", function() return NullSound end)
+                liteOverride(SfxModule, "playAt", function() return NullSound end)
+            end
+        end
+        for _, p in ipairs(Refs.Particles) do
+            pcall(function()
+                for _, e in ipairs(p.live) do
+                    if typeof(e.l) == "Instance" then e.l.Visible = false end
+                end
+            end)
+        end
+    else
+        for _, s in ipairs(LiteSaved) do
+            pcall(function() s[1][s[2]] = s[3] end)
+        end
+        table.clear(LiteSaved)
+    end
+end
+
+---------------------------------------------------------------------
+-- MISC: walkspeed, infinite jump, fly + tembus block
+---------------------------------------------------------------------
+-- Infinite jump: game dibuat mengira ada Antigravity Generator, jadi bisa lompat di udara
+local OrigJammerOn = nil
+local function infJumpWrapper(id, ...)
+    -- dimatikan saat Clear / Farmer jalan (lompat harus normal)
+    if Misc.InfJump and id == 4992 and not AutoInput.active then
+        return true
+    end
+    if OrigJammerOn then return OrigJammerOn(id, ...) end
+    return false
+end
+
+local function hookJammer()
+    local w = Refs.World
+    if not w then return end
+    local cur = rawget(w, "jammerOn")
+    if cur == infJumpWrapper or type(cur) ~= "function" then return end
+    OrigJammerOn = cur
+    w.jammerOn = infJumpWrapper
+end
+
+local function unhookJammer()
+    local w = Refs.World
+    if w and rawget(w, "jammerOn") == infJumpWrapper and OrigJammerOn then
+        w.jammerOn = OrigJammerOn
+    end
+end
+
+local function setInfJump(on)
+    Misc.InfJump = on
+    if on then hookJammer() else unhookJammer() end
+end
+
+local function setGhost(on)
+    Misc.Ghost = on
+    if not on then
+        Misc.UpHeld, Misc.DownHeld = false, false
+        if Refs.World then Refs.World.ghost = false end
+    end
+    if UI.FlyPad then UI.FlyPad.Enabled = on end
+end
+
+local function setSpeed(pct)
+    Misc.Speed = math.clamp(math.floor(tonumber(pct) or 100), 50, 500)
+    if Misc.Speed == 100 and Refs.World then Refs.World.speedScale = 1 end
+end
+
+-- Tombol gerak game dibaca dari WorldMenu.isDown. Dibungkus supaya
+-- tombol ▲/▼ Fly bisa dipakai, dan Clear / Farmer bisa "menekan" tombol sendiri.
+local OrigIsDown = nil
+local function isDownWrapper(saved, key, ...)
+    if AutoInput.active then
+        if key == "keyLeft" then return AutoInput.left end
+        if key == "keyRight" then return AutoInput.right end
+        if key == "keyJump" then return AutoInput.jump end
+        if key == "keyDown" then return AutoInput.down end
+    end
+    if Misc.Ghost then
+        if key == "keyDown" and Misc.DownHeld then return true end
+        if key == "keyJump" and Misc.UpHeld then return true end
+    end
+    return OrigIsDown(saved, key, ...)
+end
+
+if MenuModOk and type(MenuModule) == "table" and type(rawget(MenuModule, "isDown")) == "function" then
+    OrigIsDown = rawget(MenuModule, "isDown")
+    MenuModule.isDown = isDownWrapper
+end
+
+-- Pasang walkspeed & fly tiap frame (game bisa menimpanya)
+table.insert(Connections, RunService.Heartbeat:Connect(function()
+    local w = Refs.World
+    if not w or not alive() then return end
+    if Misc.Speed ~= 100 then w.speedScale = Misc.Speed / 100 end
+    if Misc.Ghost and w.ghost ~= true then w.ghost = true end
+end))
+
+---------------------------------------------------------------------
+-- FARM LOOP: place semua dulu, baru break satu per satu
+---------------------------------------------------------------------
+local stopFarm
+
+local function waitMs(ms)
+    task.wait(math.max(ms or 0, 10) / 1000)
+    return State.Running and alive()
+end
+
+local function validate()
+    local doPlace = State.Mode ~= "Break saja"
+    if not Refs.World then return "Data world belum ketemu. Tekan 'Hubungkan ke game'" end
+    if next(State.Offsets) == nil then return "Pilih tile dulu di Grid Tile" end
+    if not getPlayerTile() then return "Kamu belum masuk world" end
+    if doPlace and not State.SelectedId then return "Pilih block dari inventori" end
+    return nil
+end
+
+-- Rayman's Fist sedang dipakai? (fungsi asli game)
+local function raymanOn()
+    local w = Refs.World
+    local f = w and rawget(w, "raymanOn")
+    if type(f) ~= "function" then return false end
+    local ok, on = pcall(f)
+    return ok and on == true
+end
+
+-- Cari 2-3 tile target yang segaris dari karakter (8 arah, jarak 1-3),
+-- sama seperti pukulan Rayman di game.
+local RAY_DIRS = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 }, { 1, 1 }, { 1, -1 }, { -1, 1 }, { -1, -1 } }
+local function raymanLine(px, py, active)
+    local byKey = {}
+    for _, a in ipairs(active) do byKey[a.x .. "," .. a.y] = a end
+    local best, bestDir = nil, nil
+    for _, d in ipairs(RAY_DIRS) do
+        local line = {}
+        for i = 1, 3 do
+            local a = byKey[(px + d[1] * i) .. "," .. (py + d[2] * i)]
+            if a then line[#line + 1] = a end
+        end
+        if #line >= 2 and #line > (best and #best or 0) then best, bestDir = line, d end
+    end
+    return best, bestDir
+end
+
+-- Kabarkan gerakan Rayman ke server (paket yang sama dengan game saat pukulan Rayman)
+local function raymanAct(dir)
+    local ok, s = pcall(Refs.State)
+    if not ok or type(s) ~= "table" or not s.x then return end
+    if NetOk and type(Net) == "table" and Net.act then
+        pcall(Net.act.send, { kind = 4, x = s.x + dir[1], y = s.y - 0.475 + dir[2] })
+    end
+end
+
+local function farmLoop(runId)
+    local lastStatus = 0
+    while State.Running and alive() and State.RunId == runId do
+        local doPlace = State.Mode ~= "Break saja"
+        local doBreak = State.Mode ~= "Place saja"
+
+        local px, py = getPlayerTile()
+        if not px then
+            stopFarm("Karakter tidak ditemukan (keluar world?)")
+            return
+        end
+
+        local tiles = {}
+        for _, o in ipairs(sortedOffsets()) do
+            tiles[#tiles + 1] = { x = px + o.dx, y = py + o.dy }
+        end
+
+        local acted, outOfBlock = false, false
+
+        -- 1) Place semua tile kosong (tunggu drop di tile itu terambil dulu)
+        if doPlace then
+            for _, t in ipairs(tiles) do
+                if not State.Running then break end
+                if State.AutoCollect then waitTileDrops(t, 0.5) end
+                local r = tryPlace(t.x, t.y)
+                if r == "habis" then
+                    outOfBlock = true
+                    break
+                elseif r == "place" then
+                    acted = true
+                    if not waitMs(State.PlaceMs) then break end
+                end
+            end
+        end
+
+        -- 2) Pukul tile sampai habis (block depan lalu background).
+        --    Server hanya terima 1 pukulan tiap ~0.22 detik (tangan biasa), jadi multi target
+        --    = beberapa tile dipukul BERGANTIAN (sama seperti 2 jari). Semua tile benar-benar pecah.
+        --    Pakai Rayman's Fist: 2-3 tile segaris dipukul sekali jalan (seperti Rayman asli).
+        if doBreak then
+            local K = math.clamp(math.floor(State.MultiTarget or 1), 1, 5)
+            local nextI, active = 1, {}
+            while State.Running and alive() do
+                while #active < K and nextI <= #tiles do
+                    local t = tiles[nex... (139 KB left)
