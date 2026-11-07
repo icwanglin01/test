@@ -65,7 +65,7 @@ local RolesOk, RolesModule = pcall(require, Shared:FindFirstChild("Roles"))
 local SfxOk, SfxModule = pcall(require, Shared:FindFirstChild("Sfx"))
 
 local WindUI = loadstring(game:HttpGet(
-    "https://raw.githubusercontent.com/Mizoree-ux/Tes-aja/refs/heads/main/main.lua"
+    "https://raw.githubusercontent.com/icwanglin01/test/refs/heads/main/main.lua"
 ))()
 ---------------------------------------------------------------------
 -- PENGATURAN & DATA
